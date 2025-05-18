@@ -1,62 +1,111 @@
 #!/bin/bash
 
-cd /home/yeray/proyectos/mcoVanetza/tools/socktap/test
-
-if [ "$2" == "a" ];then
-    sudo ./conteneriza.sh
-
-else
-
-    for((i = 1; i <= $1; i++)); do
-    
-        sudo docker stop socktap$i
-
-    done
-
+# Show help message if requested
+if [[ "$1" == "--help" ]]; then
+  echo "Usage: $0 [options]"
+  echo ""
+  echo "Options:"
+  echo "  --containers N     Number of containers to launch (default: 1)"
+  echo "  --update           Rebuild the Docker image before launching"
+  echo "  --terminals        Open a terminal per container"
+  echo "  --logs             Copy logs from containers after 5 minutes"
+  echo "  --logdir PATH      Directory to store the log files (default: ~/Documents)"
+  echo "  --help             Show this help message"
+  exit 0
 fi
 
+# Parse arguments
+PARSED=$(getopt --options="" --longoptions=containers:,update,terminals,logs,logdir: --name "$0" -- "$@")
+eval set -- "$PARSED"
 
+# Default values
+CONTAINERS=1
+UPDATE=false
+TERMINALS=false
+LOGS=false
+LOGDIR="$HOME/Documents"
 
-for((i = 1; i <= $1; i++)); do
-    
-    sudo docker rm socktap$i || echo No hay contenedores con el nombre socktap$i
-
+# Read options
+while true; do
+  case "$1" in
+    --containers)
+      CONTAINERS="$2"
+      shift 2
+      ;;
+    --update)
+      UPDATE=true
+      shift
+      ;;
+    --terminals)
+      TERMINALS=true
+      shift
+      ;;
+    --logs)
+      LOGS=true
+      shift
+      ;;
+    --logdir)
+      LOGDIR="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      echo "Invalid option: $1"
+      exit 1
+      ;;
+  esac
 done
 
-if [ "$1" == "1" ]; then
+# Create log directory if it doesn't exist
+mkdir -p "$LOGDIR"
 
-    sudo docker run -ti -v /usr/local/src/socktap1:/usr/local/src/socktap --name socktap --network bridge socktap-docker
+# Go to the project directory
+cd /home/yeray/proyectos/mcoVanetza/tools/socktap/test || exit 1
 
-else
+# Stop existing containers
+for ((i = 1; i <= CONTAINERS; i++)); do
+  sudo docker stop socktap$i 2>/dev/null || echo "Container socktap$i was not running"
+done
 
-    for((i = 1; i <= $1; i++)); do
+# Remove old containers
+for ((i = 1; i <= CONTAINERS; i++)); do
+  sudo docker rm socktap$i 2>/dev/null || echo "No container socktap$i to remove"
+done
 
-        # TODO poner sleep de 100 ms / numero de contenedores
-        sudo sleep 0.0067 #100ms/15 contenedores
-        sudo docker run -d -v /usr/local/src/socktap$i:/usr/local/src/socktap --name socktap$i --network bridge socktap-docker
-
-
-    done
-
-    if [ "$3" == "t" ]; then
-
-        for((i = 1; i <= $1; i++)); do
-    
-            gnome-terminal --tab --title="Terminal de Socktap$i" -- bash -c "sudo docker logs -f socktap$i; exec bash"
-
-        done
-    fi
-
+# Rebuild Docker image if requested
+if $UPDATE; then
+  sudo ./conteneriza.sh
 fi
 
-if [ "$4" == "l" ]; then
+# Calculate sleep time: 100ms / number of containers
+SLEEP_TIME=$(awk "BEGIN {print 0.1 / $CONTAINERS}")
 
-    sudo sleep 300
-    for((i = 1; i <= $1; i++)); do
+# Launch containers
+if [ "$CONTAINERS" == "1" ]; then
+  sudo docker run -ti -v /usr/local/src/socktap1:/usr/local/src/socktap --name socktap --network bridge socktap-docker
+else
+  for ((i = 1; i <= CONTAINERS; i++)); do
+    sudo sleep "$SLEEP_TIME"
+    sudo docker run -d -v /usr/local/src/socktap$i:/usr/local/src/socktap --name socktap$i --network bridge socktap-docker
+  done
 
-        sudo docker cp socktap$i:/home/build-user/inpercept_log.log /home/yeray/Documentos/inpercept$i-3.1.log
-    
+  # Open terminals for logs if requested
+  if $TERMINALS; then
+    for ((i = 1; i <= CONTAINERS; i++)); do
+      gnome-terminal --tab --title="Socktap Terminal $i" -- bash -c "sudo docker logs -f socktap$i; exec bash"
     done
+  fi
+fi
 
-    
+# Copy logs after 5 minutes if requested
+if $LOGS; then
+  echo "Waiting 5 minutes before copying logs..."
+  sudo sleep 300
+  for ((i = 1; i <= CONTAINERS; i++)); do
+    sudo docker cp socktap$i:/home/build-user/inpercept_log.log "$LOGDIR/inpercept$i.log"
+  done
+  echo "Logs copied to: $LOGDIR"
 fi

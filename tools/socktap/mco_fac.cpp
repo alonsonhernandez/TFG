@@ -62,7 +62,6 @@ McoFac::DataConfirm McoFac::mco_data_request(const DataRequest& request, DownPac
     byte_counter_update(packet->size());
 
     register_packet(PORT, packet->size(), std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
-    
     confirm = Application::request(request, std::move(packet), PORT);
     return confirm;
 }
@@ -130,7 +129,6 @@ void McoFac::apps_average_size(){
         double data_sum = 0;
 
         for(auto iter_data : iter_app.msg_data_list ){
-
             //se añaden las cabeceras de niveles inferiores
             data_sum = data_sum + iter_data.msgSize + BTP_HEADER + GEONETWORKING_HEADER; 
             num_iter_data++;
