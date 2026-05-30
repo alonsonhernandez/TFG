@@ -43,7 +43,7 @@ int main(int argc, const char** argv)
         ("cam-traffic-class3", po::value<int>()->default_value(2), "CAM's traffic class")
         ("cam-traffic-class4", po::value<int>()->default_value(3), "CAM's traffic class")
         ("cbr,c", po::value<double>()->default_value(0.8), "CBR")
-        ("cbr_target,ct", po::value<double>()->default_value(0.68), "CBR target")
+        ("cbr_target,ct", po::value<double>()->default_value(0.68), "CBR target") //valor de delta
         ("use-mco", po::value<int>()->default_value(1), "Ejecutar con mco (!= 0) o sin mco (= 0)")
         ("num_ca, n", po::value<int>()->default_value(5), "number of application CA")
         ("print-rx-cam", "Print received CAMs")
@@ -74,7 +74,15 @@ int main(int argc, const char** argv)
         std::cerr << options << std::endl;
         return 1;
     }
+    //añadido para simular al paper
+    bool enable_mco = (vm["use-mco"].as<int>() != 0);
+
+    if (enable_mco) { 
+        std::cout << "MCO_FAC: Facilities layer congestion control enabled (Release 2)." << std::endl; 
+        std::cout << "Target CBR: " << vm["cbr_target"].as<double>() << " | T_RM: 200ms" << std::endl;    
+    }
     
+    //hasta aquí
     if (vm.count("help")) {
         std::cout << options << std::endl;
         return 1;
@@ -245,11 +253,17 @@ int main(int argc, const char** argv)
             std::cerr << "Warning: No applications are configured, only GN beacons will be exchanged\n";
         }
 
+        bool enable_printed = false;
         for (const auto& app : apps) {
-            std::cout << "Enable application '" << app.first << "'...\n";
+            if (!enable_printed) {
+                std::cout << "Enable applications...\n";
+                enable_printed = true;
+            }
             context.enable(app.second.get());
         }
 
+        // Tarea 2: Evitar que asio acabe prematuramente si se queda sin eventos momentáneos
+        asio::io_service::work work(io_service);
         io_service.run();
     } catch (PositioningException& e) {
         std::cerr << "Exit because of positioning error: " << e.what() << std::endl;

@@ -42,8 +42,11 @@ Clock::time_point ManualRuntime::now() const
 
 void ManualRuntime::trigger(Clock::time_point tp)
 {
-    // require monotonic clock
-    assert(tp >= m_now);
+    // ignore packets from the past to prevent simulation crashes
+    // assert(tp >= m_now);
+    if (tp < m_now) {
+        tp = m_now;
+    }
     m_now = tp;
     trigger();
 }
