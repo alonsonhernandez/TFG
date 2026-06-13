@@ -16,6 +16,11 @@
 #include <map>
 #include <cstdint>
 #include <vector>
+#include <queue>              // Para la cola de líneas CSV asíncrona
+#include <mutex>              // Para proteger la cola CSV
+#include <condition_variable> // Para sincronización del hilo de escritura
+#include <atomic>             // Para csv_running_
+#include <thread>             // Para el hilo de escritura CSV
 
 class McoFac : public Application
 {
@@ -26,7 +31,8 @@ public:
     using DownPacketPtr = vanetza::geonet::Router::DownPacketPtr;
 
     
-    McoFac(vanetza::PositionProvider& positioning, vanetza::Runtime& rt); 
+    McoFac(vanetza::PositionProvider& positioning, vanetza::Runtime& rt);
+    ~McoFac(); // Necesario para unir el hilo de escritura CSV al destruir el objeto
 
     DataConfirm mco_data_request(const DataRequest&, DownPacketPtr, PortType PORT); 
 
@@ -109,14 +115,24 @@ public:
 private:
     void schedule_timer();
     void on_timer(vanetza::Clock::time_point);
+    void csv_writer_loop(); // Hilo de escritura asíncrona: vacía la cola sin bloquear el hilo principal
 
     vanetza::PositionProvider& positioning_;
     vanetza::Runtime& runtime_;
     vanetza::Clock::duration mco_interval_;
     bool print_rx_msg_ = false;
     bool print_tx_msg_ = false;
+    bool traffic_diverted_ = false; // Estado del desvío de tráfico (miembro de clase, no estático local)
+    int  recovery_counter_ = 0;    // FIX 4: Hysteresis anti-ping-pong: ticks consecutivos con ambos canales libres
 
     std::ofstream csv_file;
+
+    // Infraestructura CSV asíncrona (evita bloqueos de E/S sobre volúmenes montados en WSL2)
+    std::queue<std::string>  csv_queue_;          // Cola de líneas pendientes de escribir
+    std::mutex               csv_mutex_;           // Protege el acceso a csv_queue_
+    std::condition_variable  csv_cv_;              // Señaliza al hilo cuando hay datos en la cola
+    std::atomic<bool>        csv_running_{false};  // false → el hilo debe terminar
+    std::thread              csv_writer_thread_;   // Hilo dedicado a la escritura en disco
 };
 
 #endif /* MCO_FAC_HPP_EUIC2VFR */

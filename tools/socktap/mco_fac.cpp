@@ -21,8 +21,11 @@
 #include <unistd.h> // Para usleep
 #include <algorithm> // Para std::min
 #include <cstdio> // Para std::fflush
-#include <thread> // Para sleep_for
-#include <mutex> // Para proteger la escritura asíncrona CSV
+#include <thread>             // Para el hilo de escritura asíncrona CSV
+#include <mutex>              // Para proteger la cola CSV
+#include <queue>              // Para la cola de líneas CSV
+#include <condition_variable> // Para sincronización del hilo de escritura
+#include <atomic>             // Para csv_running_
 
 using namespace vanetza;
 using namespace vanetza::facilities;
@@ -122,6 +125,55 @@ McoFac::McoFac(PositionProvider& positioning, Runtime& rt) :
     std::cout << "[MCO_SYSTEM] Host: " << hostname << " | Modo de operación detectado: " << mco_mode << std::endl;
 
     schedule_timer();
+
+    // Iniciar hilo de escritura CSV asíncrona (no bloquea el hilo de simulación)
+    csv_running_ = true;
+    csv_writer_thread_ = std::thread(&McoFac::csv_writer_loop, this);
+}
+
+McoFac::~McoFac() {
+    // Señalizar al hilo de escritura que debe terminar
+    {
+        std::lock_guard<std::mutex> lock(csv_mutex_);
+        csv_running_ = false;
+    }
+    csv_cv_.notify_all(); // Despertar al hilo por si está bloqueado esperando
+    if (csv_writer_thread_.joinable()) {
+        csv_writer_thread_.join(); // Esperar a que el hilo escriba todo lo pendiente
+    }
+    if (csv_file.is_open()) {
+        csv_file.flush();
+        csv_file.close();
+    }
+}
+
+// Hilo de escritura asíncrona: vacía la cola CSV sin bloquear el hilo principal
+void McoFac::csv_writer_loop() {
+    while (true) {
+        std::unique_lock<std::mutex> lock(csv_mutex_);
+        // Esperar hasta que haya datos en la cola o se ordene parar
+        csv_cv_.wait(lock, [this]() { return !csv_queue_.empty() || !csv_running_; });
+
+        // Procesar todas las líneas pendientes
+        while (!csv_queue_.empty()) {
+            std::string line = std::move(csv_queue_.front());
+            csv_queue_.pop();
+            lock.unlock();
+
+            if (csv_file.is_open()) {
+                csv_file << line;
+                // Sin flush() en cada línea: el SO gestiona el buffer de la partición
+                // El flush se fuerza al cerrar el archivo en el destructor
+            }
+
+            lock.lock();
+        }
+
+        // Salir del bucle solo cuando se ordenó parar Y la cola está completamente vacía
+        if (!csv_running_ && csv_queue_.empty()) {
+            break;
+        }
+    }
 }
 
 McoFac::DataConfirm McoFac::mco_data_request(const DataRequest& request, DownPacketPtr packet, PortType PORT)
@@ -302,6 +354,8 @@ void McoFac::calc_adapt_delta(bool traffic_diverted){
     double active_cbr = CBR_cch;
     if (mco_mode == "sch_only") {
         active_cbr = CBR_sch;
+    } else if (mco_mode == "mco_dynamic" || mco_mode == "mco_dinamic") {
+        active_cbr = std::max(CBR_cch, CBR_sch);
     }
 
     double delta_offset = BETA *(CBR_target - active_cbr);
@@ -445,25 +499,26 @@ void McoFac::CBR_update() {
     // 4. VISUALIZACIÓN POR CONSOLA (Barras de colores):
     // ELIMINADAS: Solo usamos el reporte cada 2 segundos dictado en on_timer para no asfixiar la CPU.
 
-    // 5. GUARDADO EN CSV ASÍNCRONO (Crucial para WSL2 donde la escritura a Windows bloquea milisegundos):
+    // 5. GUARDADO EN CSV ASÍNCRONO (cola + hilo dedicado → NO bloquea el hilo de simulación):
+    // CAUSA RAIZ DE LAS CAÍDAS CICLICAS: la escritura síncrona sobre volúmenes montados en WSL2
+    // congela el proceso ~6s cada ~10s, vaciando los contadores y provocando las bajadas bruscas de CBR.
     if (csv_file.is_open()) {
         const char* host_name = std::getenv("HOSTNAME");
         std::string host_str = host_name ? host_name : "node-1";
-        
+
         auto now = std::chrono::system_clock::now().time_since_epoch().count();
         const char* env_mco_mode = std::getenv("MCO_MODE");
         std::string mode = env_mco_mode ? env_mco_mode : "mco_dynamic";
 
-        // Formatear el texto antes de lanzarlo
-        std::string csv_line = host_str + "," + std::to_string(now) + "," + 
-                               std::to_string(CBR_cch) + "," + std::to_string(CBR_sch) + "," + 
+        // Formatear la línea y encolarla sin bloquear el hilo principal
+        std::string csv_line = host_str + "," + std::to_string(now) + "," +
+                               std::to_string(CBR_cch) + "," + std::to_string(CBR_sch) + "," +
                                std::to_string(adapt_delta) + "," + mode + "\n";
-        
-        // Despachamos un hilo independiente para guardar los datos
-        std::thread([this, csv_line]() {
-            this->csv_file << csv_line;
-            this->csv_file.flush();
-        }).detach();
+        {
+            std::lock_guard<std::mutex> lock(csv_mutex_);
+            csv_queue_.push(std::move(csv_line));
+        }
+        csv_cv_.notify_one(); // Notificar al hilo de escritura que hay trabajo
     }
 
     // 6. REINICIO DE TODOS LOS CONTADORES (Fija fugas de estado base):
@@ -603,31 +658,51 @@ void McoFac::on_timer(Clock::time_point)
 
     const double CBR_THRESHOLD = 0.68;
     const double CBR_RECOVERY_THRESHOLD = 0.58;
-    static bool traffic_diverted = false;
+    // FIX 3: traffic_diverted_ es ahora miembro de la clase (eliminada variable estática local)
 
     const char* env_mco_mode = std::getenv("MCO_MODE");
     std::string mco_mode = env_mco_mode ? env_mco_mode : "mco_dynamic";
 
     if (mco_mode == "mco_dynamic" || mco_mode == "mco_dinamic") {
-        if (CBR_cch > CBR_THRESHOLD && !traffic_diverted) {
+        // FIX 1: Solo desviar al SCH si este tiene capacidad disponible (CBR_sch < umbral)
+        // Evita enviar tráfico a un SCH ya saturado, lo cual no alivia nada y genera oscilaciones
+        if (CBR_cch > CBR_THRESHOLD && !traffic_diverted_ && CBR_sch < CBR_THRESHOLD) {
             for (auto const& pair : channel_map) {
                 if (pair.first != 2001) {
                     update_channel_mapping(pair.first, 2);
                 }
             }
             std::string hname = std::getenv("HOSTNAME") ? std::getenv("HOSTNAME") : "";
-            std::cout << "[MCO_ALGO] [" << hname << "] Umbral superado. Desviando tráfico al SCH.\n";
-            traffic_diverted = true;
-        } else if (CBR_cch < CBR_RECOVERY_THRESHOLD && traffic_diverted) {
-            for (auto const& pair : channel_map) {
-                update_channel_mapping(pair.first, 1);
+            std::cout << "[MCO_ALGO] [" << hname << "] CCH=" << CBR_cch << " > " << CBR_THRESHOLD
+                      << ", SCH=" << CBR_sch << " < " << CBR_THRESHOLD
+                      << ". Desviando trafico al SCH.\n";
+            traffic_diverted_ = true;
+            recovery_counter_ = 0; // FIX 4: Resetear hysteresis al iniciar un nuevo desvío
+        // FIX 2: Recuperar al CCH solo cuando el SCH también esté despejado (CBR_sch < umbral_recuperación)
+        // FIX 4: Exigir N ticks de estabilidad antes de recuperar (hysteresis anti-ping-pong)
+        // El ping-pong ocurre porque al devolver todo el tráfico al CCH de golpe, éste se satura
+        // inmediatamente y reinicia el ciclo. Con hysteresis confirmamos que los canales son estables.
+        } else if (CBR_cch < CBR_RECOVERY_THRESHOLD && traffic_diverted_ && CBR_sch < CBR_RECOVERY_THRESHOLD) {
+            recovery_counter_++;
+            if (recovery_counter_ >= 5) { // 5 ticks * 200 ms/tick = 1 segundo de canales estables
+                for (auto const& pair : channel_map) {
+                    update_channel_mapping(pair.first, 1);
+                }
+                std::string hname = std::getenv("HOSTNAME") ? std::getenv("HOSTNAME") : "";
+                std::cout << "[MCO_ALGO] [" << hname << "] CCH=" << CBR_cch << " < " << CBR_RECOVERY_THRESHOLD
+                          << ", SCH=" << CBR_sch << " < " << CBR_RECOVERY_THRESHOLD
+                          << ". Estables " << recovery_counter_ << " ticks. Recuperando tráfico al CCH.\n";
+                traffic_diverted_ = false;
+                recovery_counter_ = 0;
             }
-            std::string hname = std::getenv("HOSTNAME") ? std::getenv("HOSTNAME") : "";
-            std::cout << "[MCO_ALGO] [" << hname << "] Canal despejado. Recuperando tráfico al CCH.\n";
-            traffic_diverted = false;
+        } else {
+            // Si deja de cumplirse alguna condición durante el conteo, resetear el hysteresis
+            if (traffic_diverted_ && recovery_counter_ > 0) {
+                recovery_counter_ = 0;
+            }
         }
     }
 
-    calc_adapt_delta(traffic_diverted);
+    calc_adapt_delta(traffic_diverted_);
     set_adapt_interval();
 }
