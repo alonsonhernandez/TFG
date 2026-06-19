@@ -350,38 +350,54 @@ void McoFac::calc_adapt_delta(bool traffic_diverted){
 
     const char* env_mco_mode = std::getenv("MCO_MODE");
     std::string mco_mode = env_mco_mode ? env_mco_mode : "mco_dynamic";
-    
+
     double active_cbr = CBR_cch;
     if (mco_mode == "sch_only") {
         active_cbr = CBR_sch;
-    } else if (mco_mode == "mco_dynamic" || mco_mode == "mco_dinamic") {
+    } else if (mco_mode == "mco_dynamic" || mco_mode == "mco_dinamic" || mco_mode == "mco_static") {
         active_cbr = std::max(CBR_cch, CBR_sch);
     }
 
-    double delta_offset = BETA *(CBR_target - active_cbr);
+    if (active_cbr < CBR_target) {
+        // ── Régimen sin congestión (dead-band + recuperación) ─────────────────
+        // El canal no está saturado: el sistema intenta siempre alcanzar
+        // DELTA_MAX para maximizar la tasa de transmisión disponible.
+        // Se incrementa delta al ritmo máximo permitido (DELTA_OFFSET_MAX)
+        // hasta llegar a DELTA_MAX, donde queda fijo.
+        // Esto garantiza que:
+        //   a) delta nunca baja cuando no hay congestión real.
+        //   b) tras un episodio de congestión, delta se recupera gradualmente.
+        adapt_delta = std::min(adapt_delta + DELTA_OFFSET_MAX, DELTA_MAX);
+    } else {
+        // ── Régimen de congestión: LIMERIC estándar ───────────────────────────
+        // CBR >= CBR_target: reducir delta para aliviar la congestión.
+        double delta_offset = BETA * (CBR_target - active_cbr); // siempre <= 0 aquí
 
-    if(delta_offset < DELTA_OFFSET_MIN){
-        delta_offset = DELTA_OFFSET_MIN;
-    }
-    if(delta_offset > DELTA_OFFSET_MAX){
-        delta_offset = DELTA_OFFSET_MAX;
-    }
+        if (delta_offset < DELTA_OFFSET_MIN) {
+            delta_offset = DELTA_OFFSET_MIN;
+        }
+        // delta_offset > 0 no es posible aquí (active_cbr >= CBR_target),
+        // pero se mantiene el clip superior por robustez.
+        if (delta_offset > DELTA_OFFSET_MAX) {
+            delta_offset = DELTA_OFFSET_MAX;
+        }
 
-    if (traffic_diverted) {
-        delta_offset *= 0.5; // Suaviza el cambio para no ser tan brusco al liberar el CCH
-    }
+        if (traffic_diverted) {
+            delta_offset *= 0.5; // Suaviza el cambio al liberar el CCH
+        }
 
-    adapt_delta = (1 - ALPHA) * adapt_delta + delta_offset;
+        adapt_delta = (1 - ALPHA) * adapt_delta + delta_offset;
 
-    if(adapt_delta > DELTA_MAX){
-        adapt_delta = DELTA_MAX;
-    }
-    if(adapt_delta < DELTA_MIN){
-        adapt_delta = DELTA_MIN;
+        if (adapt_delta > DELTA_MAX) {
+            adapt_delta = DELTA_MAX;
+        }
+        if (adapt_delta < DELTA_MIN) {
+            adapt_delta = DELTA_MIN;
+        }
     }
 
     // Código de Logging innecesario que consumía llamadas al sistema repetitivas.
-    // LogsHandler* pLogger = NULL; 
+    // LogsHandler* pLogger = NULL;
     // pLogger = LogsHandler::getInstance();
     // struct timeval te;
     // gettimeofday(&te,NULL);
@@ -389,7 +405,7 @@ void McoFac::calc_adapt_delta(bool traffic_diverted){
     // std::stringstream ss;
     // ss << "Delta " << adapt_delta ;
     // pLogger->info(ss.str().c_str());
-    
+
 }
 
 
@@ -636,7 +652,23 @@ void McoFac::indicate(const DataIndication& indication, UpPacketPtr packet)
     };
     std::size_t payload_size = boost::apply_visitor(SizeVisitor(), *packet);
 
-    byte_counter_update(payload_size, static_cast<int>(indication.traffic_class.raw()), false);
+    // FIX: Clasificar el tráfico recibido según el canal asignado al puerto de DESTINO
+    // en el channel_map local, NO según el TC del paquete recibido.
+    // Razón: en Docker bridge todos los nodos comparten el mismo medio físico; el TC
+    // del paquete recibido podría no coincidir con la asignación de canal del receptor.
+    // Usando channel_map garantizamos que cch_only→solo CCH, sch_only→solo SCH,
+    // mco_static→ambos desde el inicio, mco_dynamic→SCH solo tras el umbral.
+    uint16_t dest_port = indication.destination_port.host();
+    int effective_tc;
+    if (channel_map.count(dest_port)) {
+        uint8_t mapped_channel = channel_map.at(dest_port);
+        // Canal 1 = CCH → TC 1 (seguridad); Canal 2 = SCH → TC 3 (servicio)
+        effective_tc = (mapped_channel == 1) ? 1 : 3;
+    } else {
+        // Puerto no registrado en el mapa: usar TC original del paquete como fallback
+        effective_tc = static_cast<int>(indication.traffic_class.raw());
+    }
+    byte_counter_update(payload_size, effective_tc, false);
 
     Application& application = search_port(indication.destination_port);
     application.indicate(indication, std::move(packet));
