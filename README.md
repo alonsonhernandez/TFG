@@ -23,7 +23,7 @@ TFG; everything else (the MCO_FAC entity, the adaptive DCC, the δ computation,
 the Traffic-Class resource sharing and the Docker environment) belongs to the
 platforms cited above.
 
-> [1] M. Sepulcre, Y. Guadalcazar, M. A. Fornell, G. Thandavarayan,
+> M. Sepulcre, Y. Guadalcazar, M. A. Fornell, G. Thandavarayan,
 > F. Paredes Vera, J. Gozalvez, A. Mohammadisarab, "V2X Congestion Control for
 > Multi-Channel Operation: a Scalable Validation in Virtualized Environments",
 > Proc. IEEE VTC2025-Spring, Oslo, Norway, June 2025.
