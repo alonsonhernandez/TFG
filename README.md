@@ -1,18 +1,66 @@
-# V2X Congestion Control for Multi-Channel Operation over Vanetza 
+# Multi-Channel Operation strategies for V2X — TFG
 
-This repository contains the open-source code developed for the following paper:
+This repository contains the code developed for a Bachelor's Thesis (TFG) at
+ETSIT-UPM on channel-selection strategies for Multi-Channel Operation (MCO) in
+V2X / ITS-G5 networks.
 
-    Miguel Sepulcre, Yeray Guadalcazar, Miguel A. Fornell, Gokulnath Thandavarayan, Francisco Paredes Vera, Javier Gozalvez, Amir Mohammadisarab, 
-    "V2X Congestion Control for Multi-Channel Operation: a Scalable Validation in Virtualized Environments", 
-    Proc. IEEE 101st Vehicular Technology Conference (VTC2025-Spring), Oslo, (Norway), 17-20 June 2025.
- 
-This paper presents the design, implementation, and extensive validation of a Facilities layer V2X congestion control solution for multi-channel operation integrated into [Vanetza](https://github.com/riebl/vanetza). Our approach dynamically adapts transmission parameters based on real-time channel conditions and the priorities and requirements of the V2X services operating in a C-ITS station. By employing a Traffic-Class based proportional fairness strategy, the solution allocates available communication resources among multiple V2X services, effectively responding to varying channel loads in real time. Scalable experimental results in a virtualized environment demonstrate that our solution meets ETSI Release 2 requirements while bridging the gap between simulation-based evaluations and real-world testing, accounting for hardware limitations and processing delays. This work lays a robust foundation for scalable and congestion-aware C-ITS testing and validation prior to real world deployments. 
+## Background and attribution
 
-The developments are provided as an extension of the [socktap](https://github.com/msepulcre/mcoVanetza/tree/desarrollo-mco/tools/socktap) tool.
+The work builds on two layers of prior code, and it is worth being clear about
+where each part comes from:
 
-Scripts are provided to run the [tests](https://github.com/msepulcre/mcoVanetza/tree/desarrollo-mco/tools/socktap/test) conducted in the paper.
+- **Vanetza** ([riebl/vanetza](https://github.com/riebl/vanetza)) is the
+  open-source implementation of the ETSI C-ITS protocol stack used as the base.
+- On top of it, **Sepulcre et al.** published a platform that integrates a
+  Facilities-layer congestion control (MCO_FAC) and a virtualized testing
+  environment over Docker, released together with their paper [1] at
+  [msepulcre/mcoVanetza](https://github.com/msepulcre/mcoVanetza). That platform
+  is the starting point of this project.
 
-## How to build
+This repository extends Sepulcre's platform to implement and evaluate different
+**channel-selection strategies**. The contributions below are the work of this
+TFG; everything else (the MCO_FAC entity, the adaptive DCC, the δ computation,
+the Traffic-Class resource sharing and the Docker environment) belongs to the
+platforms cited above.
 
-Follow the Vanetza instructions on [prerequisites](https://www.vanetza.org/how-to-build/#prerequisites) and [steps for compilation](https://www.vanetza.org/how-to-build/#compilation), and the [Docker](https://www.docker.com/) website.
+> [1] M. Sepulcre, Y. Guadalcazar, M. A. Fornell, G. Thandavarayan,
+> F. Paredes Vera, J. Gozalvez, A. Mohammadisarab, "V2X Congestion Control for
+> Multi-Channel Operation: a Scalable Validation in Virtualized Environments",
+> Proc. IEEE VTC2025-Spring, Oslo, Norway, June 2025.
 
+## What this TFG adds
+
+The extensions developed in this repository, all integrated into the `socktap`
+tool, are:
+
+1. **Four channel-selection modes.** Traffic is split between the control
+   channel (CCH) and a service channel (SCH) according to the selected mode:
+   `cch_only`, `sch_only`, `mco_static` (fixed split by criticality) and
+   `mco_dynamic` (adaptive).
+
+2. **Dynamic mode with hysteresis.** In `mco_dynamic`, non-critical traffic is
+   offloaded to the SCH when the CCH load crosses an activation threshold (0.68)
+   and returns to the CCH only when it drops below a lower recovery threshold
+   (0.58). The two-threshold design, together with a short dead-band before
+   reverting, avoids ping-pong between channels. Critical CAM traffic
+   (port 2001) always stays on the CCH.
+
+3. **Per-channel CBR measurement.** The CBR is now estimated separately for each
+   channel, using independent byte counters for CCH and SCH.
+
+4. **Asynchronous logging.** The telemetry logging was redesigned with a
+   producer–consumer scheme and one CSV file per container, so that disk writes
+   no longer block the main loop. This removed the timing errors that appeared
+   when scaling to tens of concurrent containers under WSL2.
+
+5. **Node entry/exit scenarios.** Added Docker Compose setups and orchestration
+   scripts to inject and remove vehicles during a running simulation, plus the
+   Python tools used to aggregate the per-node CSVs and plot CBR and δ.
+
+## Building and running
+
+Build follows the original Vanetza instructions
+([prerequisites](https://www.vanetza.org/how-to-build/#prerequisites),
+[compilation](https://www.vanetza.org/how-to-build/#compilation)). The test
+scenarios run on [Docker](https://www.docker.com/); the compose files and
+scripts to reproduce the experiments are included in this repository.
